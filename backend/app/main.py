@@ -1,8 +1,9 @@
 """
 FastAPI application entry point.
 
-Sets up the application, CORS middleware, and routes.
-The Groq service is initialized at startup and stored in app state.
+Provides a ``create_app`` factory that builds the fully-configured
+application.  The module-level ``app`` object is created by calling
+the factory with default settings for production use.
 """
 
 from contextlib import asynccontextmanager
@@ -10,53 +11,72 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.services.groq_service import GroqService
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def create_app(settings: Settings | None = None) -> FastAPI:
     """
-    Application lifespan handler.
+    Application factory.
 
-    Initializes the Groq service on startup and attaches it to app state.
-    This ensures the API key is validated before serving any requests.
+    Creates and configures the FastAPI application instance.
+
+    Args:
+        settings: Optional Settings override.  When ``None`` (the default),
+                  ``get_settings()`` is called, which reads from environment
+                  variables and the ``.env`` file.  Pass a custom Settings
+                  instance in tests to control configuration without touching
+                  the environment.
     """
-    settings = get_settings()
-    app.state.settings = settings
-    app.state.groq_service = GroqService(settings)
-    yield
+    if settings is None:
+        settings = get_settings()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        """Initialise the Groq service on startup if an API key is present."""
+        app.state.settings = settings
+        if settings.GROQ_API_KEY:
+            app.state.groq_service = GroqService(settings)
+        else:
+            app.state.groq_service = None
+        yield
+
+    application = FastAPI(
+        title="AI Study Assistant API",
+        description="Backend API for generating flashcards and quizzes from study materials.",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+
+    # CORS — configured at app-creation time from Settings.CORS_ORIGINS
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # ------------------------------------------------------------------
+    # Routes
+    # ------------------------------------------------------------------
+
+    @application.get("/api/health")
+    async def health_check():
+        """
+        Lightweight health-check endpoint.
+
+        Returns backend availability and Groq configuration state.
+        Does **not** make any network calls to Groq.
+        """
+        groq_service = getattr(application.state, "groq_service", None)
+        return {
+            "status": "healthy",
+            "groq_client": "initialized" if groq_service is not None else "not_configured",
+        }
+
+    return application
 
 
-app = FastAPI(
-    title="AI Study Assistant API",
-    description="Backend API for generating flashcards and quizzes from study materials.",
-    version="0.1.0",
-    lifespan=lifespan,
-)
-
-# CORS: default origins for React dev servers (CRA on 3000, Vite on 5173).
-# These are safe defaults; they can be overridden via the CORS_ORIGINS env var
-# once settings load at startup.  The middleware is added here so that even
-# the health endpoint works cross-origin during development.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.get("/api/health")
-async def health_check():
-    """
-    Health-check endpoint.
-
-    Returns the service status and confirms the Groq client is initialised.
-    """
-    groq_ready = hasattr(app.state, "groq_service") and app.state.groq_service is not None
-    return {
-        "status": "healthy",
-        "groq_client": "connected" if groq_ready else "not initialized",
-    }
+# Production application instance
+app = create_app()
