@@ -20,6 +20,8 @@ def _isolate_env(monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("CORS_ORIGINS", raising=False)
     monkeypatch.delenv("GROQ_MODEL", raising=False)
+    monkeypatch.delenv("MAX_UPLOAD_SIZE_BYTES", raising=False)
+    monkeypatch.delenv("MAX_PDF_PAGES", raising=False)
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

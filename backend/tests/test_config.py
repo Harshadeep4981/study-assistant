@@ -31,6 +31,33 @@ class TestSettingsDefaults:
         settings = Settings()
         assert settings.GROQ_MODEL == "llama-3.1-8b-instant"
 
+    def test_default_max_pdf_pages(self):
+        """Default MAX_PDF_PAGES is 100."""
+        settings = Settings()
+        assert settings.MAX_PDF_PAGES == 100
+
+    def test_max_pdf_pages_must_be_positive(self):
+        """MAX_PDF_PAGES must be positive (> 0)."""
+        import pytest
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            Settings(MAX_PDF_PAGES=0)
+
+        with pytest.raises(ValidationError):
+            Settings(MAX_PDF_PAGES=-10)
+
+    def test_max_upload_size_bytes_must_be_positive(self):
+        """MAX_UPLOAD_SIZE_BYTES must be positive (> 0)."""
+        import pytest
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            Settings(MAX_UPLOAD_SIZE_BYTES=0)
+
+        with pytest.raises(ValidationError):
+            Settings(MAX_UPLOAD_SIZE_BYTES=-1024)
+
 
 class TestGetSettingsCache:
     """get_settings must be cached and clearable."""
@@ -59,6 +86,14 @@ class TestEnvironmentVariableLoading:
 
         settings = get_settings()
         assert settings.GROQ_API_KEY == expected_key
+
+    def test_max_pdf_pages_read_from_environment(self, monkeypatch):
+        """MAX_PDF_PAGES is read from the genuine environment variable."""
+        monkeypatch.setenv("MAX_PDF_PAGES", "42")
+        get_settings.cache_clear()
+
+        settings = get_settings()
+        assert settings.MAX_PDF_PAGES == 42
 
     def test_cors_origins_parsed_from_json_environment_variable(self, monkeypatch):
         """CORS_ORIGINS is correctly parsed from a JSON list in the environment."""
