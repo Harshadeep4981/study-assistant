@@ -1,15 +1,25 @@
 """Shared fixtures for the test suite."""
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app.config import Settings, get_settings
 from app.main import create_app
-from fastapi.testclient import TestClient
 
 
 @pytest.fixture(autouse=True)
-def _clear_settings_cache():
-    """Clear the lru_cache on get_settings before and after every test."""
+def _isolate_env(monkeypatch):
+    """
+    Ensure complete test isolation from ambient environment variables and external .env.
+
+    Clears settings cache before and after every test, disables loading of any external
+    .env file, and strips ambient environment variables so tests run predictably regardless
+    of developer machine state.
+    """
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("CORS_ORIGINS", raising=False)
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

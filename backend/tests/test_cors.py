@@ -1,6 +1,6 @@
 """Tests for CORS middleware configuration."""
 
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.main import create_app
 from fastapi.testclient import TestClient
 
@@ -41,7 +41,7 @@ class TestDefaultCORS:
 
 
 class TestCustomCORS:
-    """CORS_ORIGINS environment variable must change the allowed origins."""
+    """CORS_ORIGINS configuration must change the allowed origins."""
 
     def test_custom_origin_allowed(self):
         """A custom origin specified in CORS_ORIGINS must be allowed."""
@@ -72,3 +72,18 @@ class TestCustomCORS:
                 },
             )
             assert response.headers.get("access-control-allow-origin") is None
+
+    def test_cors_origins_from_env_variable(self, monkeypatch):
+        """Setting CORS_ORIGINS via environment variable controls middleware behavior."""
+        custom = "http://from-env.example.com:3000"
+        monkeypatch.setenv("CORS_ORIGINS", f'["{custom}"]')
+        get_settings.cache_clear()
+        with TestClient(create_app()) as client:
+            response = client.options(
+                "/api/health",
+                headers={
+                    "Origin": custom,
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+            assert response.headers.get("access-control-allow-origin") == custom

@@ -28,6 +28,7 @@ An AI-powered study tool that generates interactive flashcards and quizzes from 
 - Fixed output budgets with AI response validation.
 - Groq API key is never exposed to the frontend.
 - Text-based PDFs only; image-only PDFs are rejected with a clear message.
+- Decoupled startup: backend starts without an API key; future AI endpoints will depend on `get_groq_service` to return HTTP 503 if the key is not configured.
 
 ## Tech Stack
 
@@ -98,7 +99,7 @@ PORT=8000
 | `HOST`         | No       | `0.0.0.0`                                            | Server bind address                  |
 | `PORT`         | No       | `8000`                                               | Server port                          |
 
-> \* The backend starts without `GROQ_API_KEY`, but AI features (flashcard and quiz generation) will return HTTP 503 until it is configured.
+> \* The backend starts without `GROQ_API_KEY`. Groq client initialization and the `get_groq_service` dependency are implemented. Flashcard and quiz generation endpoints are planned for future milestones and are not yet implemented; once created, those endpoints will inject `get_groq_service` to return HTTP 503 if the Groq API key is unconfigured.
 
 > **Security**: The `.env` file is listed in `.gitignore` and must never be committed.
 
@@ -125,6 +126,8 @@ pytest tests/ -v
 | GET    | `/api/health`  | Health check and Groq client status  | Implemented |
 | GET    | `/docs`        | Interactive Swagger UI               | Automatic   |
 | GET    | `/redoc`       | Alternative API documentation        | Automatic   |
+
+> **Planned AI Endpoints**: Generation endpoints (such as `POST /api/flashcards` and `POST /api/quiz`) are planned for upcoming milestones and are currently not implemented. They will rely on the `get_groq_service` FastAPI dependency to ensure requests return an HTTP 503 error if the server is running without a configured `GROQ_API_KEY`.
 
 #### Health Endpoint Response
 
@@ -156,8 +159,8 @@ Study_Assistant/
 │   │       └── groq_service.py    # Groq client + get_groq_service dependency
 │   ├── tests/
 │   │   ├── __init__.py
-│   │   ├── conftest.py            # Shared fixtures
-│   │   ├── test_config.py         # Configuration tests
+│   │   ├── conftest.py            # Shared fixtures with environment isolation
+│   │   ├── test_config.py         # Configuration & env-variable tests
 │   │   ├── test_cors.py           # CORS middleware tests
 │   │   ├── test_groq_service.py   # Groq service & dependency tests
 │   │   └── test_health.py         # Health endpoint & startup tests
@@ -177,17 +180,17 @@ Study_Assistant/
 - [x] Pydantic Settings with `@lru_cache` and reliable `.env` path
 - [x] Optional `GROQ_API_KEY` — backend starts without it
 - [x] Groq client initialization as a service (only when key is present)
-- [x] `get_groq_service` dependency with HTTP 503 on missing configuration
+- [x] `get_groq_service` dependency implemented (ready for future AI endpoints to return HTTP 503 when unconfigured)
 - [x] CORS configured from `Settings.CORS_ORIGINS` (default: localhost:3000, localhost:5173)
 - [x] Health check endpoint (`GET /api/health`) with accurate Groq status
 - [x] `.gitignore` with rules for secrets, venv, and build artifacts
-- [x] Automated test suite (21 tests)
-- [ ] Document processing (TXT and PDF upload)
-- [ ] Hierarchical summarization
-- [ ] Flashcard generation endpoint
-- [ ] Quiz generation endpoint
-- [ ] React frontend
-- [ ] Retest incorrect answers
+- [x] Automated test suite with environment isolation
+- [ ] Document processing (TXT and PDF upload) — Planned
+- [ ] Hierarchical summarization — Planned
+- [ ] Flashcard generation endpoint — Planned
+- [ ] Quiz generation endpoint — Planned
+- [ ] React frontend — Planned
+- [ ] Retest incorrect answers — Planned
 
 ---
 
