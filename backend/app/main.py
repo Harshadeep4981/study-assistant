@@ -8,6 +8,7 @@ the factory with default settings for production use.
 
 from contextlib import asynccontextmanager
 
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -15,7 +16,13 @@ from fastapi.responses import JSONResponse
 from app.config import Settings, get_settings
 from app.middleware import RequestSizeLimitMiddleware
 from app.routers.documents import router as documents_router
-from app.services.exceptions import DocumentProcessingError
+from app.routers.generate import router as generate_router
+from app.services.exceptions import (
+    AIBudgetExceededError,
+    AIGenerationError,
+    AIRateLimitError,
+    DocumentProcessingError,
+)
 from app.services.groq_service import GroqService
 
 
@@ -48,7 +55,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application = FastAPI(
         title="AI Study Assistant API",
         description="Backend API for generating flashcards and quizzes from study materials.",
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan,
     )
 
@@ -60,10 +67,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             content={"detail": exc.message},
         )
 
-    # Request body size limit — enforced on POST /api/documents/ingest before parsing
+    # Global handler for AI generation domain exceptions
+    @application.exception_handler(AIGenerationError)
+    async def ai_generation_error_handler(request: Request, exc: AIGenerationError):
+        headers: dict[str, str] = {}
+        if isinstance(exc, AIRateLimitError) and exc.retry_after is not None:
+            headers["Retry-After"] = str(exc.retry_after)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.message},
+            headers=headers if headers else None,
+        )
+
+    # Handler for StarletteHTTPException, preserving status code when caused by domain exceptions
+    @application.exception_handler(StarletteHTTPException)
+    async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
+        cause = getattr(exc, "__cause__", None)
+        if isinstance(cause, DocumentProcessingError):
+            return JSONResponse(
+                status_code=cause.status_code,
+                content={"detail": cause.message},
+            )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=exc.headers,
+        )
+
+    # Request body size limit — enforced on protected POST endpoints before parsing
     application.add_middleware(
         RequestSizeLimitMiddleware,
-        max_bytes=settings.MAX_UPLOAD_SIZE_BYTES,
+        max_upload_bytes=settings.MAX_UPLOAD_SIZE_BYTES,
+        max_generation_bytes=settings.MAX_GENERATION_REQUEST_BODY_BYTES,
     )
 
     # CORS — configured at app-creation time from Settings.CORS_ORIGINS
@@ -79,6 +114,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Routers
     # ------------------------------------------------------------------
     application.include_router(documents_router)
+    application.include_router(generate_router)
 
     # ------------------------------------------------------------------
     # Health check route

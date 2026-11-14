@@ -26,6 +26,37 @@ router = APIRouter(prefix="/api/documents", tags=["Documents"])
         "or file uploads (`.txt`, `.pdf`) via `multipart/form-data` with field name `file`. "
         "Extracts, normalizes, and returns plain text with metadata."
     ),
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "file": {
+                                "type": "string",
+                                "format": "binary",
+                                "description": "Upload a .pdf or .txt file",
+                            },
+                        },
+                        "required": ["file"],
+                    }
+                },
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "text": {
+                                "type": "string",
+                                "description": "Pasted study notes",
+                            }
+                        },
+                        "required": ["text"],
+                    }
+                },
+            }
+        }
+    },
     responses={
         200: {"description": "Document successfully extracted and normalized."},
         400: {"description": "Empty text, invalid encoding, corrupted or encrypted PDF."},
@@ -108,6 +139,10 @@ async def ingest_document(
         ) and bool(getattr(file_item, "filename", None))
 
         has_text = isinstance(text_item, str) and bool(text_item.strip())
+
+        # If a real file is attached, ignore Swagger UI's auto-generated dummy "string" placeholder
+        if has_file and has_text and text_item.strip() == "string":
+            has_text = False
 
         # Disallow ambiguous requests providing both file and text
         if has_file and has_text:

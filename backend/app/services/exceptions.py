@@ -115,3 +115,102 @@ class OversizedFileError(DocumentProcessingError):
     def __init__(self, message: str = "File size exceeds the allowed limit."):
         super().__init__(message=message, status_code=413)
 
+
+# ----------------------------------------------------------------------
+# AI Generation domain exceptions
+# ----------------------------------------------------------------------
+
+
+class AIGenerationError(Exception):
+    """Base exception for AI generation errors."""
+
+    def __init__(self, message: str, status_code: int = 502):
+        self.message = message
+        self.status_code = status_code
+        super().__init__(message)
+
+
+class AIAuthenticationError(AIGenerationError):
+    """Raised when Groq API key is invalid or unauthorized."""
+
+    def __init__(
+        self,
+        message: str = (
+            "AI service authentication failed. "
+            "Please check that a valid GROQ_API_KEY is configured."
+        ),
+    ):
+        super().__init__(message=message, status_code=502)
+
+
+class AIRateLimitError(AIGenerationError):
+    """Raised when Groq API rate limit is exceeded."""
+
+    def __init__(
+        self,
+        message: str = "AI service rate limit exceeded. Please try again later.",
+        retry_after: int | None = None,
+    ):
+        super().__init__(message=message, status_code=429)
+        self.retry_after = retry_after
+
+
+class AIBudgetExceededError(AIGenerationError):
+    """Raised when request-level processing budget (API calls or operations) is exhausted."""
+
+    def __init__(
+        self,
+        message: str = (
+            "Request processing budget exceeded. The document requires more AI operations "
+            "or API calls than the allowed allowance for a single request."
+        ),
+        status_code: int = 429,
+    ):
+        super().__init__(message=message, status_code=status_code)
+
+
+class AITimeoutError(AIGenerationError):
+    """Raised when Groq API call times out."""
+
+    def __init__(
+        self,
+        message: str = "AI service request timed out while generating content. Please try again.",
+    ):
+        super().__init__(message=message, status_code=504)
+
+
+class AIProviderError(AIGenerationError):
+    """Raised when Groq API returns a generic connection or status error."""
+
+    def __init__(
+        self,
+        message: str = "An error occurred while communicating with the AI service.",
+    ):
+        super().__init__(message=message, status_code=502)
+
+
+class AIGenerationValidationError(AIGenerationError):
+    """Raised when AI output fails JSON parsing or schema validation after all retries."""
+
+    def __init__(
+        self,
+        message: str = (
+            "Failed to generate valid study material from the AI provider. "
+            "The model output could not be parsed or validated after retries."
+        ),
+    ):
+        super().__init__(message=message, status_code=502)
+
+
+class AISummarizationError(AIGenerationError):
+    """Raised when an error occurs during large-document chunking or summarization."""
+
+    def __init__(
+        self,
+        message: str = (
+            "An error occurred while summarizing large study material. "
+            "Failed to produce a valid consolidated summary after retries."
+        ),
+    ):
+        super().__init__(message=message, status_code=502)
+

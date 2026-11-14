@@ -1,8 +1,8 @@
 """
 Request size limit ASGI middleware.
 
-Enforces MAX_UPLOAD_SIZE_BYTES on incoming request bodies for the document
-ingestion endpoint before and during body reading, preventing unbounded
+Enforces route-specific maximum byte limits on incoming request bodies
+for protected endpoints before and during body reading, preventing unbounded
 memory usage or disk spooling for both JSON and multipart requests.
 """
 
@@ -31,46 +31,80 @@ def format_byte_size(num_bytes: int) -> str:
 
 
 class RequestSizeLimitMiddleware:
-    """
-    ASGI middleware enforcing a maximum byte limit on incoming request bodies
-    for the document ingestion endpoint (POST /api/documents/ingest).
+    r"""
+    ASGI middleware enforcing route-specific byte limits on incoming request bodies
+    before and during body reading.
 
-    1. Checks 'content-length' header if present; rejects early with HTTP 413.
+    Protected routes and limits:
+    - POST /api/documents/ingest: max_upload_bytes (e.g. 10 MB)
+    - POST /api/generate/flashcards: max_generation_bytes (e.g. ~3 MB raw JSON body limit, allowing worst-case \u00XX escaping for 500 KB documents)
+    - POST /api/generate/quiz: max_generation_bytes (e.g. ~3 MB raw JSON body limit, allowing worst-case \u00XX escaping for 500 KB documents)
+
+    Enforcement mechanism:
+    1. Checks 'content-length' header if present; rejects early with HTTP 413
+       before the request body is read or parsed by downstream handlers.
     2. Wraps the ASGI 'receive' callable to monitor bytes in real-time as they
        arrive over the network, aborting immediately with HTTP 413 if the
-       accumulated body size exceeds max_bytes, even if 'content-length' is
+       accumulated body size exceeds the route limit, even if 'content-length' is
        missing or misleading.
     3. Other routes and HTTP methods pass through without size-limit handling.
     """
 
     INGEST_PATH = "/api/documents/ingest"
-    INGEST_METHOD = "POST"
+    FLASHCARDS_PATH = "/api/generate/flashcards"
+    QUIZ_PATH = "/api/generate/quiz"
 
-    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        max_upload_bytes: int | None = None,
+        max_generation_bytes: int | None = None,
+        max_bytes: int | None = None,
+    ) -> None:
         self.app = app
-        self.max_bytes = max_bytes
+        if max_upload_bytes is not None:
+            self.max_upload_bytes = max_upload_bytes
+        elif max_bytes is not None:
+            self.max_upload_bytes = max_bytes
+        else:
+            raise ValueError("max_upload_bytes must be specified.")
+
+        if max_generation_bytes is not None:
+            self.max_generation_bytes = max_generation_bytes
+        elif max_bytes is not None:
+            self.max_generation_bytes = max_bytes
+        else:
+            self.max_generation_bytes = self.max_upload_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        # Scope size-limit enforcement strictly to POST /api/documents/ingest
-        if (
-            scope.get("path") != self.INGEST_PATH
-            or scope.get("method", "").upper() != self.INGEST_METHOD
-        ):
+        method = scope.get("method", "").upper()
+        path = scope.get("path", "")
+
+        # Determine route-specific limit
+        route_limit: int | None = None
+        if method == "POST":
+            if path == self.INGEST_PATH:
+                route_limit = self.max_upload_bytes
+            elif path in (self.FLASHCARDS_PATH, self.QUIZ_PATH):
+                route_limit = self.max_generation_bytes
+
+        # Pass through unaffected if route is not protected
+        if route_limit is None:
             await self.app(scope, receive, send)
             return
 
-        limit_str = format_byte_size(self.max_bytes)
+        limit_str = format_byte_size(route_limit)
 
         # 1. Early rejection via Content-Length header if present
         for name, value in scope.get("headers", []):
             if name.lower() == b"content-length":
                 try:
                     content_length = int(value.decode("latin1"))
-                    if content_length > self.max_bytes:
+                    if content_length > route_limit:
                         response = JSONResponse(
                             status_code=413,
                             content={
@@ -92,7 +126,7 @@ class RequestSizeLimitMiddleware:
             if message["type"] == "http.request":
                 chunk = message.get("body", b"")
                 total_received += len(chunk)
-                if total_received > self.max_bytes:
+                if total_received > route_limit:
                     raise OversizedFileError(
                         f"Request body exceeds the maximum limit of {limit_str}."
                     )

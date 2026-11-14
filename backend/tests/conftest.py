@@ -21,7 +21,11 @@ def _isolate_env(monkeypatch):
     monkeypatch.delenv("CORS_ORIGINS", raising=False)
     monkeypatch.delenv("GROQ_MODEL", raising=False)
     monkeypatch.delenv("MAX_UPLOAD_SIZE_BYTES", raising=False)
+    monkeypatch.delenv("MAX_GENERATION_INPUT_BYTES", raising=False)
+    monkeypatch.delenv("MAX_LARGE_DOCUMENT_BYTES", raising=False)
+    monkeypatch.delenv("MAX_GENERATION_REQUEST_BODY_BYTES", raising=False)
     monkeypatch.delenv("MAX_PDF_PAGES", raising=False)
+    monkeypatch.delenv("AI_MAX_RETRIES", raising=False)
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
