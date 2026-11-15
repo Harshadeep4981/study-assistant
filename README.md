@@ -122,7 +122,7 @@ Backend settings are read from `backend/.env`; see `backend/.env.example` for de
 | `MAX_PDF_PAGES` | 100 | Configurable PDF page cap (maximum allowed: 100 pages) |
 | `MAX_GENERATION_INPUT_BYTES` | 100 KiB | Direct generation input threshold |
 | `MAX_LARGE_DOCUMENT_BYTES` | 500 KiB | Maximum supported extracted material size |
-| `MAX_GENERATION_REQUEST_BODY_BYTES` | derived | Safe generation JSON body limit; derived from the large-document limit when unset |
+| `MAX_GENERATION_REQUEST_BODY_BYTES` | 3,104,768 bytes (2.96 MiB) | Safe generation JSON body limit; derived as `(6 × MAX_LARGE_DOCUMENT_BYTES) + 32 KiB` when unset |
 | `AI_MAX_RETRIES` | 2 | Bounded retries for invalid AI output |
 | `AI_MAX_REQUEST_CALLS` | 120 | Per-request AI call budget |
 | `AI_REQUEST_TIMEOUT_SECONDS` | 300 | Per-request processing time budget |
@@ -188,6 +188,22 @@ pytest tests/ -v
 
 The frontend test suite uses Vitest, jsdom, and React Testing Library. Backend tests use pytest and httpx; AI-dependent tests use test doubles rather than sending provider requests.
 
+These commands run the complete frontend and backend test suites. The targeted checks performed during the latest project verification were not a substitute for running both complete suites.
+
 ## Docker
 
-Docker or Compose configuration is not included in this repository. Use the local setup instructions above.
+Dockerfiles and a Compose configuration are included for running the frontend and backend together. Docker Compose builds a static production frontend image and the FastAPI backend image.
+
+1. Install Docker Desktop (or Docker Engine with the Compose plugin).
+2. From the repository root, optionally create a `.env` file containing `GROQ_API_KEY=your_groq_api_key_here`. Ingestion and health checks work without the key; flashcard and quiz generation require it.
+3. Start both services:
+
+   ```bash
+   docker compose up --build
+   ```
+
+4. Open `http://localhost:8080`. The backend health endpoint is `http://localhost:8000/api/health`, and Swagger UI is `http://localhost:8000/docs`.
+
+The frontend image receives `VITE_API_BASE_URL` at build time and defaults to `http://localhost:8000`, which is the API address reachable by the user's browser. If the browser accesses the app from another host, set `VITE_API_BASE_URL` in the root `.env` to an API URL reachable from that browser, then rebuild with `docker compose up --build`. Compose allows the frontend origin `http://localhost:8080` through backend CORS. Uploaded documents and study progress are not persisted by the containers; the application has no database or permanent document storage.
+
+Stop the services with `Ctrl+C`, or run `docker compose down` in a second terminal.
