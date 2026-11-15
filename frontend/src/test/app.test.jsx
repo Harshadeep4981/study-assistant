@@ -53,7 +53,7 @@ function jsonResponse(payload, { ok = true, status = 200 } = {}) {
 async function createStudySetInApp(user, notes = 'Photosynthesis study notes') {
   await user.type(screen.getByRole('textbox', { name: /study notes or topic/i }), notes)
   await user.click(screen.getByRole('button', { name: /create study set/i }))
-  await screen.findByRole('heading', { name: 'Ready to make it stick?' })
+  await screen.findByRole('heading', { name: 'Choose how you want to learn.' })
 }
 
 async function openFlashcardsInApp(user) {
@@ -203,9 +203,9 @@ describe('study set ingestion and workspace', () => {
     expect(url).toBe('http://localhost:8000/api/documents/ingest')
     expect(JSON.parse(options.body)).toEqual({ text: 'Raw pasted notes' })
     expect(options.body).not.toContain('file')
-    expect(await screen.findByRole('heading', { name: 'Ready to make it stick?' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Choose how you want to learn.' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Your study material' })).toBeInTheDocument()
-    expect(screen.getByText(/material processed/i)).toBeInTheDocument()
+    expect(screen.getByText(/processed and ready/i)).toBeInTheDocument()
     expect(screen.getByText(/pasted notes/i)).toBeInTheDocument()
     expect(screen.getByText(/32 characters/i)).toBeInTheDocument()
   })
@@ -231,7 +231,7 @@ describe('study set ingestion and workspace', () => {
     expect(options.headers['Content-Type']).toBeUndefined()
     expect(await screen.findByText('lesson.txt')).toBeInTheDocument()
     expect(screen.getByText(/source · TXT/i)).toBeInTheDocument()
-    expect(screen.getByText(/material processed/i)).toBeInTheDocument()
+    expect(screen.getByText(/processed and ready/i)).toBeInTheDocument()
   })
 
   it('keeps the creation screen visible and shows backend validation errors', async () => {
@@ -245,7 +245,7 @@ describe('study set ingestion and workspace', () => {
     await user.click(screen.getByRole('button', { name: /create study set/i }))
     expect(await screen.findByRole('status')).toHaveTextContent(/text input cannot be empty/i)
     expect(screen.getByRole('heading', { name: 'Turn what you study into what you know.' })).toBeInTheDocument()
-    expect(screen.queryByRole('heading', { name: 'Ready to make it stick?' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Choose how you want to learn.' })).not.toBeInTheDocument()
   })
 
   it('displays the backend PDF page-limit error clearly', async () => {
@@ -267,7 +267,7 @@ describe('study set ingestion and workspace', () => {
     await user.type(screen.getByRole('textbox', { name: /study notes or topic/i }), 'Notes')
     await user.click(screen.getByRole('button', { name: /create study set/i }))
     expect(await screen.findByRole('status')).toHaveTextContent(/unable to connect to the study assistant server/i)
-    expect(screen.queryByRole('heading', { name: 'Ready to make it stick?' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Choose how you want to learn.' })).not.toBeInTheDocument()
     expect(screen.queryByText(/socket internals/i)).not.toBeInTheDocument()
   })
 
@@ -285,7 +285,7 @@ describe('study set ingestion and workspace', () => {
     expect(screen.getByRole('tab', { name: /upload document/i })).toBeDisabled()
     expect(fetchMock).toHaveBeenCalledOnce()
     resolveFetch({ ok: true, json: async () => ingestionResponse() })
-    expect(await screen.findByRole('heading', { name: 'Ready to make it stick?' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Choose how you want to learn.' })).toBeInTheDocument()
   })
 
   it('starts a new study set and clears the prior active study set and form content', async () => {
@@ -294,7 +294,7 @@ describe('study set ingestion and workspace', () => {
     render(<App />)
     await user.type(screen.getByRole('textbox', { name: /study notes or topic/i }), 'Old notes')
     await user.click(screen.getByRole('button', { name: /create study set/i }))
-    await screen.findByRole('heading', { name: 'Ready to make it stick?' })
+    await screen.findByRole('heading', { name: 'Choose how you want to learn.' })
     await user.click(screen.getByRole('button', { name: /start new study set/i }))
 
     expect(screen.getByRole('heading', { name: 'Turn what you study into what you know.' })).toBeInTheDocument()
@@ -556,7 +556,7 @@ describe('AI quiz flow', () => {
     expect(fetchMock).toHaveBeenCalledOnce()
     await openQuizInApp(user)
 
-    expect(await screen.findByRole('heading', { name: 'Quiz' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Quick quiz' })).toBeInTheDocument()
     expect(screen.getByText('Which planet is known as the Red Planet?')).toBeInTheDocument()
     expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuemax', '2')
     expect(screen.queryByText('Correct answer')).not.toBeInTheDocument()
@@ -728,7 +728,7 @@ describe('AI quiz flow', () => {
     await user.click(screen.getByRole('button', { name: /review incorrect answers/i }))
     expect(await screen.findByRole('heading', { name: /review incorrect answers/i })).toBeInTheDocument()
     expect(screen.getByText('Which planet is known as the Red Planet?')).toBeInTheDocument()
-    expect(screen.getByText('Correct answer')).toBeInTheDocument()
+    expect(screen.getByText('correct answer')).toBeInTheDocument()
     expect(screen.getByText('Your answer:').parentElement).toHaveTextContent('Your answer: Venus')
     expect(screen.getByText(/mars appears red because iron minerals/i)).toBeInTheDocument()
   })
