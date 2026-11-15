@@ -37,6 +37,7 @@ from app.services.generation_service import (
 )
 from app.services.groq_service import GroqService, get_groq_service
 from app.services.processing_budget import ProcessingBudget
+from app.services.provider_resilience import ProviderRequestCoordinator
 from app.services.summarization_service import (
     CHUNK_SUMMARIZATION_SYSTEM_PROMPT,
     CONSOLIDATION_SYSTEM_PROMPT,
@@ -69,6 +70,21 @@ def mock_groq():
     service = MagicMock(spec=GroqService)
     service.client = MagicMock()
     service.model = "qwen/qwen3.8-27b"
+    service.settings = Settings(
+        GROQ_API_KEY="test-mock-key",
+        AI_PROVIDER_RATE_LIMIT_MAX_RETRIES=1,
+        AI_PROVIDER_TRANSIENT_MAX_RETRIES=0,
+        AI_PROVIDER_MIN_REQUEST_INTERVAL_SECONDS=0,
+        AI_PROVIDER_BACKOFF_INITIAL_SECONDS=0,
+        AI_PROVIDER_TRANSIENT_BACKOFF_INITIAL_SECONDS=0,
+    )
+    fake_now = [0.0]
+    service.coordinator = ProviderRequestCoordinator(
+        service.settings,
+        clock=lambda: fake_now[0],
+        sleep=lambda seconds: fake_now.__setitem__(0, fake_now[0] + seconds),
+        random_value=lambda: 0.5,
+    )
     return service
 
 
@@ -1232,14 +1248,14 @@ class TestRateLimitSafeHandling:
         assert budget.calls_consumed == 2
 
     def test_rate_limit_with_large_retry_after_fails_fast_without_blind_retry(self, mock_groq):
-        """When retry-after is > 2s (e.g. 25s), service fails fast immediately without sleeping."""
+        """A provider wait hint that exceeds the remaining request budget is not slept through."""
         req = httpx.Request("POST", "https://api.groq.com")
         resp = httpx.Response(status_code=429, headers={"retry-after": "25"}, request=req)
         mock_groq.client.chat.completions.create.side_effect = RateLimitError(
             "Rate limit hit", response=resp, body=None
         )
 
-        budget = ProcessingBudget(max_calls=5, max_duration_seconds=60.0, max_operations=5)
+        budget = ProcessingBudget(max_calls=5, max_duration_seconds=10.0, max_operations=5)
         service = SummarizationService(mock_groq)
 
         with pytest.raises(AIRateLimitError) as exc_info:

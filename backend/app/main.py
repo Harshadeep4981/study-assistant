@@ -14,10 +14,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import Settings, get_settings
-from app.middleware import RequestSizeLimitMiddleware
+from app.middleware import CorrelationIdMiddleware, RequestSizeLimitMiddleware
 from app.routers.documents import router as documents_router
 from app.routers.generate import router as generate_router
 from app.services.exceptions import (
+    AICircuitOpenError,
     AIBudgetExceededError,
     AIGenerationError,
     AIRateLimitError,
@@ -73,6 +74,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         headers: dict[str, str] = {}
         if isinstance(exc, AIRateLimitError) and exc.retry_after is not None:
             headers["Retry-After"] = str(exc.retry_after)
+        elif isinstance(exc, AICircuitOpenError) and exc.retry_after is not None:
+            headers["Retry-After"] = str(exc.retry_after)
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": exc.message},
@@ -108,7 +111,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Request-ID"],
     )
+
+    # Request ID and timing middleware (outermost)
+    application.add_middleware(CorrelationIdMiddleware)
 
     # ------------------------------------------------------------------
     # Routers

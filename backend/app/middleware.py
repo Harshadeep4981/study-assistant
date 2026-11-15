@@ -1,15 +1,85 @@
 """
-Request size limit ASGI middleware.
+ASGI middlewares for request size limits, correlation tracking, and safe request timing.
 
 Enforces route-specific maximum byte limits on incoming request bodies
 for protected endpoints before and during body reading, preventing unbounded
 memory usage or disk spooling for both JSON and multipart requests.
 """
 
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+
+from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.services.exceptions import OversizedFileError
+
+logger = logging.getLogger(__name__)
+
+
+class CorrelationIdMiddleware:
+    """
+    ASGI middleware that attaches an X-Request-ID correlation ID to every HTTP request
+    and logs safe timing and status metadata without logging request bodies or sensitive contents.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(raw=scope.get("headers", []))
+        incoming_id = headers.get("x-request-id")
+        request_id = incoming_id.strip() if incoming_id and incoming_id.strip() else str(uuid.uuid4())
+
+        if "state" not in scope:
+            scope["state"] = {}
+        scope["state"]["request_id"] = request_id
+
+        method = scope.get("method", "")
+        path = scope.get("path", "")
+        start_time = time.monotonic()
+
+        logger.info(
+            "HTTP request started",
+            extra={"request_id": request_id, "http_method": method, "http_path": path},
+        )
+
+        status_code = 500
+
+        async def send_with_request_id(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message.get("status", 200)
+                raw_headers = list(message.get("headers", []))
+                has_req_id = any(h[0].lower() == b"x-request-id" for h in raw_headers)
+                if not has_req_id:
+                    raw_headers.append((b"x-request-id", request_id.encode("ascii", errors="ignore")))
+                    message = dict(message)
+                    message["headers"] = raw_headers
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_request_id)
+        finally:
+            duration_ms = (time.monotonic() - start_time) * 1000.0
+            logger.info(
+                "HTTP request completed",
+                extra={
+                    "request_id": request_id,
+                    "http_method": method,
+                    "http_path": path,
+                    "http_status": status_code,
+                    "duration_ms": round(duration_ms, 2),
+                },
+            )
 
 
 def format_byte_size(num_bytes: int) -> str:

@@ -31,6 +31,7 @@ from app.models.generation import QuizQuestion
 from app.services.exceptions import AIGenerationValidationError
 from app.services.generation_service import GenerationService
 from app.services.groq_service import GroqService, get_groq_service
+from app.services.provider_resilience import ProviderRequestCoordinator
 
 
 # ----------------------------------------------------------------------
@@ -52,6 +53,21 @@ def mock_groq():
     """Provides a mocked GroqService instance with a mock client."""
     mock_service = MagicMock(spec=GroqService)
     mock_service.model = "llama-3.1-8b-instant"
+    mock_service.settings = Settings(
+        GROQ_API_KEY="test-mock-key",
+        AI_PROVIDER_RATE_LIMIT_MAX_RETRIES=1,
+        AI_PROVIDER_TRANSIENT_MAX_RETRIES=0,
+        AI_PROVIDER_MIN_REQUEST_INTERVAL_SECONDS=0,
+        AI_PROVIDER_BACKOFF_INITIAL_SECONDS=0,
+        AI_PROVIDER_TRANSIENT_BACKOFF_INITIAL_SECONDS=0,
+    )
+    fake_now = [0.0]
+    mock_service.coordinator = ProviderRequestCoordinator(
+        mock_service.settings,
+        clock=lambda: fake_now[0],
+        sleep=lambda seconds: fake_now.__setitem__(0, fake_now[0] + seconds),
+        random_value=lambda: 0.5,
+    )
     mock_client = MagicMock()
     mock_service.client = mock_client
     return mock_service
@@ -60,7 +76,14 @@ def mock_groq():
 @pytest.fixture
 def client_with_mock_groq(mock_groq):
     """TestClient wired with mock GroqService dependency."""
-    settings = Settings(GROQ_API_KEY="test-mock-key")
+    settings = Settings(
+        GROQ_API_KEY="test-mock-key",
+        AI_PROVIDER_RATE_LIMIT_MAX_RETRIES=1,
+        AI_PROVIDER_TRANSIENT_MAX_RETRIES=0,
+        AI_PROVIDER_MIN_REQUEST_INTERVAL_SECONDS=0,
+        AI_PROVIDER_BACKOFF_INITIAL_SECONDS=0,
+        AI_PROVIDER_TRANSIENT_BACKOFF_INITIAL_SECONDS=0,
+    )
     app = create_app(settings)
     app.dependency_overrides[get_groq_service] = lambda: mock_groq
     with TestClient(app) as client:

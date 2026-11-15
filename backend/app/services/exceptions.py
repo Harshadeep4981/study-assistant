@@ -155,6 +155,28 @@ class AIRateLimitError(AIGenerationError):
         self.retry_after = retry_after
 
 
+class AIQuotaExceededError(AIGenerationError):
+    """Raised when the provider account has exhausted its quota or billing allowance."""
+
+    def __init__(
+        self,
+        message: str = "AI generation is unavailable because the provider account has reached its usage limit.",
+    ):
+        super().__init__(message=message, status_code=503)
+
+
+class AICircuitOpenError(AIGenerationError):
+    """Raised when repeated provider rate limits temporarily open the circuit."""
+
+    def __init__(
+        self,
+        message: str = "AI service is temporarily unavailable. Please try again shortly.",
+        retry_after: int | None = None,
+    ):
+        super().__init__(message=message, status_code=503)
+        self.retry_after = retry_after
+
+
 class AIBudgetExceededError(AIGenerationError):
     """Raised when request-level processing budget (API calls or operations) is exhausted."""
 

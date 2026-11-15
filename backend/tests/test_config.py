@@ -31,6 +31,30 @@ class TestSettingsDefaults:
         settings = Settings()
         assert settings.GROQ_MODEL == "qwen/qwen3.8-27b"
 
+    def test_provider_resilience_defaults(self):
+        settings = Settings()
+        assert settings.AI_PROVIDER_RATE_LIMIT_MAX_RETRIES == 5
+        assert settings.AI_PROVIDER_TRANSIENT_MAX_RETRIES == 2
+        assert settings.AI_PROVIDER_BACKOFF_INITIAL_SECONDS == 1.0
+        assert settings.AI_PROVIDER_BACKOFF_MULTIPLIER == 2.0
+        assert settings.AI_PROVIDER_BACKOFF_MAX_SECONDS == 16.0
+        assert settings.AI_PROVIDER_MIN_REQUEST_INTERVAL_SECONDS == 0.25
+        assert settings.AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD == 3
+        assert settings.AI_CIRCUIT_BREAKER_RECOVERY_SECONDS == 30.0
+
+    def test_provider_backoff_maximum_must_not_be_less_than_initial(self):
+        import pytest
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="cannot be less than"):
+            Settings(AI_PROVIDER_BACKOFF_INITIAL_SECONDS=3, AI_PROVIDER_BACKOFF_MAX_SECONDS=2)
+
+        with pytest.raises(ValidationError, match="cannot be less than"):
+            Settings(
+                AI_PROVIDER_TRANSIENT_BACKOFF_INITIAL_SECONDS=3,
+                AI_PROVIDER_TRANSIENT_BACKOFF_MAX_SECONDS=2,
+            )
+
     def test_default_max_large_document_bytes(self):
         """Default MAX_LARGE_DOCUMENT_BYTES is 500 KB (512,000 bytes) when input bytes is default."""
         settings = Settings()
@@ -80,6 +104,13 @@ class TestSettingsDefaults:
 
         with pytest.raises(ValidationError):
             Settings(MAX_PDF_PAGES=-10)
+
+    def test_max_pdf_pages_cannot_exceed_100(self):
+        import pytest
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="cannot exceed the Studywise limit of 100 pages"):
+            Settings(MAX_PDF_PAGES=101)
 
     def test_max_upload_size_bytes_must_be_positive(self):
         """MAX_UPLOAD_SIZE_BYTES must be positive (> 0)."""

@@ -314,6 +314,27 @@ class TestPDFUpload:
             detail = response.json()["detail"]
             assert "exceeds the maximum allowed limit of 3 pages" in detail
 
+    def test_default_100_page_limit_accepts_boundary_and_rejects_101_pages(self):
+        """The ingestion API accepts 100-page PDFs and rejects larger PDFs with HTTP 413."""
+        with TestClient(create_app()) as client:
+            boundary_pdf = helper_make_multipage_pdf(num_pages=100)
+            boundary_response = client.post(
+                "/api/documents/ingest",
+                files={"file": ("boundary.pdf", boundary_pdf, "application/pdf")},
+            )
+            assert boundary_response.status_code == 200
+            assert boundary_response.json()["metadata"]["page_count"] == 100
+
+            oversized_pdf = helper_make_multipage_pdf(num_pages=101)
+            response = client.post(
+                "/api/documents/ingest",
+                files={"file": ("oversized.pdf", oversized_pdf, "application/pdf")},
+            )
+            assert response.status_code == 413
+            assert response.json()["detail"] == (
+                "The PDF contains 101 pages, which exceeds the maximum allowed limit of 100 pages."
+            )
+
 
 class TestSecurityAndResourceLimits:
     """Tests for file size limits, content validation, and unsupported file types."""

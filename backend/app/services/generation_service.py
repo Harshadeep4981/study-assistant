@@ -6,7 +6,8 @@ JSON parsing, strict Pydantic validation, and bounded retry loops with correctio
 """
 
 import json
-import time
+import logging
+import math
 from typing import Any
 
 from groq import (
@@ -28,16 +29,27 @@ from app.models.generation import (
     QuizQuestion,
 )
 from app.services.exceptions import (
+    AICircuitOpenError,
     AIAuthenticationError,
     AIBudgetExceededError,
     AIGenerationValidationError,
     AIProviderError,
     AIRateLimitError,
+    AIQuotaExceededError,
     AITimeoutError,
     OversizedFileError,
 )
 from app.services.groq_service import GroqService
 from app.services.processing_budget import ProcessingBudget
+from app.services.provider_resilience import (
+    ProviderRequestCoordinator,
+    classify_rate_limit,
+    extract_retry_after_seconds,
+    provider_error_code,
+)
+from app.services.summary_cache import DocumentSummaryCache
+
+logger = logging.getLogger(__name__)
 
 FLASHCARD_SYSTEM_PROMPT = (
     "You are an expert educational study assistant. Your task is to generate "
@@ -118,17 +130,9 @@ def clean_and_parse_json(raw_text: str) -> dict[str, Any]:
 
 
 def extract_retry_after(exc: RateLimitError) -> int | None:
-    """Extract Retry-After duration in seconds from Groq SDK RateLimitError if available."""
-    try:
-        response = getattr(exc, "response", None)
-        if response is not None:
-            headers = getattr(response, "headers", {})
-            retry_val = headers.get("retry-after") or headers.get("Retry-After")
-            if retry_val is not None:
-                return max(1, int(float(retry_val)))
-    except Exception:
-        pass
-    return None
+    """Extract an integer Retry-After hint for the HTTP response to our caller."""
+    seconds = extract_retry_after_seconds(exc)
+    return max(1, math.ceil(seconds)) if seconds is not None else None
 
 
 class GenerationService:
@@ -141,10 +145,24 @@ class GenerationService:
         groq_service: GroqService,
         settings: Settings | None = None,
         summarization_service: Any | None = None,
+        coordinator: ProviderRequestCoordinator | None = None,
+        summary_cache: DocumentSummaryCache | None = None,
     ) -> None:
         self.groq_service = groq_service
-        self.settings = settings or get_settings()
+        self.settings = settings or getattr(groq_service, "settings", None) or get_settings()
         self.summarization_service = summarization_service
+        shared_coordinator = getattr(groq_service, "coordinator", None)
+        self.coordinator = coordinator or (
+            shared_coordinator
+            if isinstance(shared_coordinator, ProviderRequestCoordinator)
+            else ProviderRequestCoordinator(self.settings)
+        )
+        shared_cache = getattr(groq_service, "summary_cache", None)
+        self.summary_cache = summary_cache or (
+            shared_cache
+            if isinstance(shared_cache, DocumentSummaryCache)
+            else None
+        )
 
     def _call_groq(
         self,
@@ -160,99 +178,154 @@ class GenerationService:
         deadline. Total request-level wall-clock deadlines are strictly enforced by verifying
         `budget.check_deadline()` immediately before and after every provider call.
         """
-        if budget is not None:
-            budget.consume_call(min_remaining=0.1)
-
-        call_timeout = (
-            min(self.DEFAULT_CALL_TIMEOUT, budget.remaining_seconds())
-            if budget is not None
-            else self.DEFAULT_CALL_TIMEOUT
-        )
-
         try:
-            completion = self.groq_service.client.chat.completions.create(
-                model=self.groq_service.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0.3,
-                timeout=call_timeout,
-            )
-            # Immediately verify request deadline after provider call completes
-            if budget is not None:
-                budget.check_deadline()
-
-            choice = completion.choices[0]
-            content = choice.message.content or ""
-            return content.strip()
-        except AuthenticationError as exc:
-            raise AIAuthenticationError() from exc
-        except RateLimitError as exc:
-            retry_after = extract_retry_after(exc)
-            # Safe bounded backoff: only retry if explicitly instructed, bounded <= 2s, and budget allows
-            if (
-                retry_after is not None
-                and retry_after <= 2.0
-                and budget is not None
-                and budget.remaining_seconds() > (retry_after + 2.0)
-            ):
-                try:
-                    time.sleep(retry_after)
+            self.coordinator.begin_call(budget)
+        except (AIBudgetExceededError, AITimeoutError, AICircuitOpenError):
+            self.coordinator.other_outcome()
+            raise
+        rate_retries = 0
+        transient_retries = 0
+        try:
+            while True:
+                if budget is not None:
                     budget.consume_call(min_remaining=0.1)
-                    retry_call_timeout = (
-                        min(self.DEFAULT_CALL_TIMEOUT, budget.remaining_seconds())
-                        if budget is not None
-                        else self.DEFAULT_CALL_TIMEOUT
+                    call_timeout = min(self.DEFAULT_CALL_TIMEOUT, budget.remaining_seconds())
+                else:
+                    call_timeout = self.DEFAULT_CALL_TIMEOUT
+
+                try:
+                    logger.info(
+                        "Calling AI provider",
+                        extra={"provider_attempt": rate_retries + transient_retries + 1},
                     )
-                    retry_completion = self.groq_service.client.chat.completions.create(
+                    completion = self.groq_service.client.chat.completions.create(
                         model=self.groq_service.model,
                         messages=messages,
                         response_format={"type": "json_object"},
                         temperature=0.3,
-                        timeout=retry_call_timeout,
+                        timeout=call_timeout,
                     )
                     if budget is not None:
                         budget.check_deadline()
+                    self.coordinator.succeeded()
+                    choice = completion.choices[0]
+                    return (choice.message.content or "").strip()
+                except RateLimitError as exc:
+                    category = classify_rate_limit(exc)
+                    retry_after_seconds = extract_retry_after_seconds(exc)
+                    retry_after = extract_retry_after(exc)
+                    code = provider_error_code(exc)
+                    logger.warning(
+                        "AI provider rate limit response",
+                        extra={
+                            "provider_status": 429,
+                            "provider_code": code if code in {"rate_limit_exceeded", "rate_limit_reached", "insufficient_quota", "quota_exceeded", "billing_hard_limit_reached", "billing_not_active"} else "other",
+                            "retryable": category == "temporary",
+                        },
+                    )
+                    if category == "quota":
+                        self.coordinator.other_outcome()
+                        raise AIQuotaExceededError() from exc
+                    if category != "temporary":
+                        self.coordinator.other_outcome()
+                        raise AIRateLimitError(retry_after=retry_after) from exc
 
-                    choice = retry_completion.choices[0]
-                    content = choice.message.content or ""
-                    return content.strip()
-                except RateLimitError as retry_exc:
-                    new_retry_after = extract_retry_after(retry_exc) or retry_after
-                    raise AIRateLimitError(retry_after=new_retry_after) from retry_exc
-                except APITimeoutError as retry_exc:
-                    raise AITimeoutError() from retry_exc
-                except (APIConnectionError, APIStatusError, GroqError) as retry_exc:
-                    raise AIProviderError() from retry_exc
-                except (
-                    AIBudgetExceededError,
-                    AITimeoutError,
-                    AIAuthenticationError,
-                    AIRateLimitError,
-                    AIProviderError,
-                ):
+                    if rate_retries >= self.settings.AI_PROVIDER_RATE_LIMIT_MAX_RETRIES:
+                        self.coordinator.rate_limited()
+                        raise AIRateLimitError(retry_after=retry_after) from exc
+
+                    delay = retry_after_seconds
+                    if delay is None:
+                        delay = self.coordinator.backoff(
+                            rate_retries,
+                            initial=self.settings.AI_PROVIDER_BACKOFF_INITIAL_SECONDS,
+                            maximum=self.settings.AI_PROVIDER_BACKOFF_MAX_SECONDS,
+                            multiplier=self.settings.AI_PROVIDER_BACKOFF_MULTIPLIER,
+                        )
+                    logger.warning(
+                        "Retrying temporary AI provider rate limit",
+                        extra={"retry_attempt": rate_retries + 1, "retry_delay_seconds": delay, "provider_status": 429},
+                    )
+                    if not self.coordinator.wait_for_retry(delay, budget):
+                        self.coordinator.rate_limited()
+                        raise AIRateLimitError(retry_after=retry_after) from exc
+                    rate_retries += 1
+                    continue
+                except AuthenticationError as exc:
+                    self.coordinator.other_outcome()
+                    logger.error("AI provider authentication failed", extra={"provider_status": 401})
+                    raise AIAuthenticationError() from exc
+                except APITimeoutError as exc:
+                    if transient_retries < self.settings.AI_PROVIDER_TRANSIENT_MAX_RETRIES:
+                        delay = self.coordinator.backoff(
+                            transient_retries,
+                            initial=self.settings.AI_PROVIDER_TRANSIENT_BACKOFF_INITIAL_SECONDS,
+                            maximum=self.settings.AI_PROVIDER_TRANSIENT_BACKOFF_MAX_SECONDS,
+                            multiplier=self.settings.AI_PROVIDER_BACKOFF_MULTIPLIER,
+                        )
+                        logger.warning(
+                            "Retrying AI provider timeout",
+                            extra={"retry_attempt": transient_retries + 1, "retry_delay_seconds": delay},
+                        )
+                        if self.coordinator.wait_for_retry(delay, budget):
+                            transient_retries += 1
+                            continue
+                    self.coordinator.other_outcome()
+                    raise AITimeoutError() from exc
+                except APIConnectionError as exc:
+                    if transient_retries < self.settings.AI_PROVIDER_TRANSIENT_MAX_RETRIES:
+                        delay = self.coordinator.backoff(
+                            transient_retries,
+                            initial=self.settings.AI_PROVIDER_TRANSIENT_BACKOFF_INITIAL_SECONDS,
+                            maximum=self.settings.AI_PROVIDER_TRANSIENT_BACKOFF_MAX_SECONDS,
+                            multiplier=self.settings.AI_PROVIDER_BACKOFF_MULTIPLIER,
+                        )
+                        logger.warning(
+                            "Retrying AI provider connection failure",
+                            extra={"retry_attempt": transient_retries + 1, "retry_delay_seconds": delay},
+                        )
+                        if self.coordinator.wait_for_retry(delay, budget):
+                            transient_retries += 1
+                            continue
+                    self.coordinator.other_outcome()
+                    raise AIProviderError() from exc
+                except APIStatusError as exc:
+                    status_code = getattr(exc, "status_code", None)
+                    logger.error(
+                        "AI provider returned an HTTP error",
+                        extra={"provider_status": status_code, "provider_error_type": type(exc).__name__},
+                    )
+                    if status_code is not None and (status_code == 408 or status_code >= 500):
+                        if transient_retries < self.settings.AI_PROVIDER_TRANSIENT_MAX_RETRIES:
+                            delay = self.coordinator.backoff(
+                                transient_retries,
+                                initial=self.settings.AI_PROVIDER_TRANSIENT_BACKOFF_INITIAL_SECONDS,
+                                maximum=self.settings.AI_PROVIDER_TRANSIENT_BACKOFF_MAX_SECONDS,
+                                multiplier=self.settings.AI_PROVIDER_BACKOFF_MULTIPLIER,
+                            )
+                            logger.warning(
+                                "Retrying transient AI provider status",
+                                extra={"retry_attempt": transient_retries + 1, "retry_delay_seconds": delay, "provider_status": status_code},
+                            )
+                            if self.coordinator.wait_for_retry(delay, budget):
+                                transient_retries += 1
+                                continue
+                    self.coordinator.other_outcome()
+                    raise AIProviderError() from exc
+                except GroqError as exc:
+                    self.coordinator.other_outcome()
+                    logger.error("AI provider request failed", extra={"provider_error_type": type(exc).__name__})
+                    raise AIProviderError() from exc
+                except (AIBudgetExceededError, AITimeoutError, AICircuitOpenError):
+                    self.coordinator.other_outcome()
                     raise
-                except Exception as retry_exc:
-                    raise AIProviderError(
-                        "An unexpected error occurred while communicating with the AI service during rate-limit retry."
-                    ) from retry_exc
-
-            raise AIRateLimitError(retry_after=retry_after) from exc
-        except APITimeoutError as exc:
-            raise AITimeoutError() from exc
-        except (APIConnectionError, APIStatusError, GroqError) as exc:
-            raise AIProviderError() from exc
-        except (
-            AIAuthenticationError,
-            AIRateLimitError,
-            AITimeoutError,
-            AIProviderError,
-            AIBudgetExceededError,
-        ):
+                except Exception as exc:
+                    self.coordinator.other_outcome()
+                    logger.error("Unexpected AI provider failure", extra={"provider_error_type": type(exc).__name__})
+                    raise AIProviderError() from exc
+        except (AIBudgetExceededError, AITimeoutError, AICircuitOpenError):
+            self.coordinator.other_outcome()
             raise
-        except Exception as exc:
-            raise AIProviderError(
-                "An unexpected error occurred while communicating with the AI service."
-            ) from exc
 
     def _validate_flashcards(
         self, data: dict[str, Any], expected_count: int
@@ -364,7 +437,10 @@ class GenerationService:
                 from app.services.summarization_service import SummarizationService
 
                 self.summarization_service = SummarizationService(
-                    groq_service=self.groq_service, settings=self.settings
+                    groq_service=self.groq_service,
+                    settings=self.settings,
+                    coordinator=self.coordinator,
+                    summary_cache=self.summary_cache,
                 )
             study_text = self.summarization_service.summarize_large_document(
                 text,
@@ -400,6 +476,11 @@ class GenerationService:
                 last_errors = errors
             except (ValueError, json.JSONDecodeError) as parse_err:
                 last_errors = [f"JSON parsing error: {parse_err}"]
+
+            logger.warning(
+                "AI response did not pass flashcard schema validation",
+                extra={"validation_error_count": len(last_errors), "correction_attempt": attempt + 1},
+            )
 
             # If attempts remain, append correction message
             if attempt < max_retries:
@@ -459,7 +540,10 @@ class GenerationService:
                 from app.services.summarization_service import SummarizationService
 
                 self.summarization_service = SummarizationService(
-                    groq_service=self.groq_service, settings=self.settings
+                    groq_service=self.groq_service,
+                    settings=self.settings,
+                    coordinator=self.coordinator,
+                    summary_cache=self.summary_cache,
                 )
             study_text = self.summarization_service.summarize_large_document(
                 text,
@@ -495,6 +579,11 @@ class GenerationService:
                 last_errors = errors
             except (ValueError, json.JSONDecodeError) as parse_err:
                 last_errors = [f"JSON parsing error: {parse_err}"]
+
+            logger.warning(
+                "AI response did not pass quiz schema validation",
+                extra={"validation_error_count": len(last_errors), "correction_attempt": attempt + 1},
+            )
 
             # If attempts remain, append correction message
             if attempt < max_retries:

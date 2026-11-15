@@ -268,4 +268,3 @@ def get_document_service(request: Request) -> DocumentService:
     """
     settings = getattr(request.app.state, "settings", None) or get_settings()
     return DocumentService(settings)
-

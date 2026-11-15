@@ -93,6 +93,22 @@ class Settings(BaseSettings):
     # Sized to accommodate MAX_LARGE_DOCUMENT_BYTES (500 KB: 69 chunk ops + 17 L2 + 5 L3 + 1 final synthesis = 92 operations, <= 100).
     AI_MAX_SUMMARIZATION_OPERATIONS: int = Field(default=100, gt=0)
 
+    # Provider retries are separate from AI_MAX_RETRIES, which retries malformed model output.
+    AI_PROVIDER_RATE_LIMIT_MAX_RETRIES: int = Field(default=5, ge=0, le=10)
+    AI_PROVIDER_TRANSIENT_MAX_RETRIES: int = Field(default=2, ge=0, le=5)
+    AI_PROVIDER_BACKOFF_INITIAL_SECONDS: float = Field(default=1.0, ge=0)
+    AI_PROVIDER_BACKOFF_MULTIPLIER: float = Field(default=2.0, ge=1.0)
+    AI_PROVIDER_BACKOFF_MAX_SECONDS: float = Field(default=16.0, gt=0)
+    AI_PROVIDER_TRANSIENT_BACKOFF_INITIAL_SECONDS: float = Field(default=0.5, ge=0)
+    AI_PROVIDER_TRANSIENT_BACKOFF_MAX_SECONDS: float = Field(default=2.0, gt=0)
+    AI_PROVIDER_MIN_REQUEST_INTERVAL_SECONDS: float = Field(default=0.25, ge=0)
+    AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = Field(default=3, gt=0)
+    AI_CIRCUIT_BREAKER_RECOVERY_SECONDS: float = Field(default=30.0, gt=0)
+
+    # In-memory document summary cache configuration
+    AI_SUMMARY_CACHE_MAX_ENTRIES: int = Field(default=50, gt=0)
+    AI_SUMMARY_CACHE_TTL_SECONDS: float = Field(default=3600.0, gt=0)
+
     # Server configuration
     HOST: str = "0.0.0.0"
     PORT: int = 8000
@@ -151,11 +167,21 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_provider_retry_bounds(self) -> "Settings":
+        if self.AI_PROVIDER_BACKOFF_MAX_SECONDS < self.AI_PROVIDER_BACKOFF_INITIAL_SECONDS:
+            raise ValueError("AI_PROVIDER_BACKOFF_MAX_SECONDS cannot be less than the initial backoff.")
+        if self.AI_PROVIDER_TRANSIENT_BACKOFF_MAX_SECONDS < self.AI_PROVIDER_TRANSIENT_BACKOFF_INITIAL_SECONDS:
+            raise ValueError("AI_PROVIDER_TRANSIENT_BACKOFF_MAX_SECONDS cannot be less than the transient initial backoff.")
+        return self
+
     @field_validator("MAX_PDF_PAGES")
     @classmethod
     def validate_max_pdf_pages(cls, v: int) -> int:
         if v <= 0:
             raise ValueError("MAX_PDF_PAGES must be positive.")
+        if v > 100:
+            raise ValueError("MAX_PDF_PAGES cannot exceed the Studywise limit of 100 pages.")
         return v
 
     @field_validator("AI_MAX_RETRIES")

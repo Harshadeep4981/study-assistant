@@ -7,7 +7,11 @@ using bounded LLM summarization passes, and consolidates them hierarchically wit
 safe token and byte budgets for downstream flashcard and quiz generation.
 """
 
+from __future__ import annotations
+
 import json
+import logging
+import math
 import re
 import time
 from typing import Any
@@ -25,14 +29,25 @@ from app.config import Settings, get_settings
 from app.services.exceptions import (
     AIAuthenticationError,
     AIBudgetExceededError,
+    AICircuitOpenError,
     AIGenerationValidationError,
     AIProviderError,
+    AIQuotaExceededError,
     AIRateLimitError,
     AISummarizationError,
     AITimeoutError,
 )
 from app.services.groq_service import GroqService
 from app.services.processing_budget import ProcessingBudget
+from app.services.provider_resilience import (
+    ProviderRequestCoordinator,
+    classify_rate_limit,
+    extract_retry_after_seconds,
+    provider_error_code,
+)
+from app.services.summary_cache import DocumentSummaryCache
+
+logger = logging.getLogger(__name__)
 
 MAX_INTERMEDIATE_SUMMARY_CHARS: int = 12000
 
@@ -296,21 +311,39 @@ class SummarizationService:
     """Service handling semantic chunking and hierarchical summarization for large study materials."""
 
     MAX_HIERARCHICAL_DEPTH: int = 3
-
     DEFAULT_CALL_TIMEOUT: float = 30.0
 
-    def __init__(self, groq_service: GroqService, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        groq_service: GroqService,
+        settings: Settings | None = None,
+        coordinator: ProviderRequestCoordinator | None = None,
+        summary_cache: DocumentSummaryCache | None = None,
+    ) -> None:
         self.groq_service = groq_service
-        self.settings = settings or get_settings()
+        self.settings = settings or getattr(groq_service, "settings", None) or get_settings()
+        shared_coordinator = getattr(groq_service, "coordinator", None)
+        self.coordinator = coordinator or (
+            shared_coordinator
+            if isinstance(shared_coordinator, ProviderRequestCoordinator)
+            else ProviderRequestCoordinator(self.settings)
+        )
+        shared_cache = getattr(groq_service, "summary_cache", None)
+        self.summary_cache = summary_cache or (
+            shared_cache
+            if isinstance(shared_cache, DocumentSummaryCache)
+            else None
+        )
 
     def _call_groq(
         self,
         messages: list[dict[str, str]],
-        max_tokens: int = 1200,
+        max_tokens: int = 600,
         budget: ProcessingBudget | None = None,
     ) -> str:
         """
-        Execute chat completion call to Groq, mapping provider errors to domain exceptions.
+        Execute chat completion call to Groq, coordinating requests through the shared
+        ProviderRequestCoordinator with rate-limit pacing, exponential backoff, and circuit breaking.
 
         Note on provider timeout semantics:
         The underlying HTTPX client used by the Groq SDK interprets float `timeout` as per-operation
@@ -318,101 +351,160 @@ class SummarizationService:
         deadline. Total request-level wall-clock deadlines are strictly enforced by verifying
         `budget.check_deadline()` immediately before and after every provider call.
         """
-        if budget is not None:
-            budget.consume_call(min_remaining=0.1)
+        try:
+            self.coordinator.begin_call(budget)
+        except (AIBudgetExceededError, AITimeoutError, AICircuitOpenError):
+            self.coordinator.other_outcome()
+            raise
 
-        call_timeout = (
-            min(self.DEFAULT_CALL_TIMEOUT, budget.remaining_seconds())
-            if budget is not None
-            else self.DEFAULT_CALL_TIMEOUT
-        )
+        rate_retries = 0
+        transient_retries = 0
 
         try:
-            completion = self.groq_service.client.chat.completions.create(
-                model=self.groq_service.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0.2,
-                max_tokens=max_tokens,
-                timeout=call_timeout,
-            )
-            # Immediately verify request deadline after provider call completes
-            if budget is not None:
-                budget.check_deadline()
-
-            choice = completion.choices[0]
-            content = choice.message.content or ""
-            return content.strip()
-        except AuthenticationError as exc:
-            raise AIAuthenticationError() from exc
-        except RateLimitError as exc:
-            retry_after = extract_retry_after(exc)
-            # Safe bounded backoff: only retry if explicitly instructed, bounded <= 2s, and budget allows
-            if (
-                retry_after is not None
-                and retry_after <= 2.0
-                and budget is not None
-                and budget.remaining_seconds() > (retry_after + 2.0)
-            ):
-                try:
-                    time.sleep(retry_after)
+            while True:
+                if budget is not None:
                     budget.consume_call(min_remaining=0.1)
-                    retry_call_timeout = (
-                        min(self.DEFAULT_CALL_TIMEOUT, budget.remaining_seconds())
-                        if budget is not None
-                        else self.DEFAULT_CALL_TIMEOUT
+                    call_timeout = min(self.DEFAULT_CALL_TIMEOUT, budget.remaining_seconds())
+                else:
+                    call_timeout = self.DEFAULT_CALL_TIMEOUT
+
+                try:
+                    logger.info(
+                        "Calling AI provider for summarization",
+                        extra={"provider_attempt": rate_retries + transient_retries + 1},
                     )
-                    retry_completion = self.groq_service.client.chat.completions.create(
+                    completion = self.groq_service.client.chat.completions.create(
                         model=self.groq_service.model,
                         messages=messages,
                         response_format={"type": "json_object"},
                         temperature=0.2,
                         max_tokens=max_tokens,
-                        timeout=retry_call_timeout,
+                        timeout=call_timeout,
                     )
                     if budget is not None:
                         budget.check_deadline()
-
-                    choice = retry_completion.choices[0]
+                    self.coordinator.succeeded()
+                    choice = completion.choices[0]
                     content = choice.message.content or ""
                     return content.strip()
-                except RateLimitError as retry_exc:
-                    new_retry_after = extract_retry_after(retry_exc) or retry_after
-                    raise AIRateLimitError(retry_after=new_retry_after) from retry_exc
-                except APITimeoutError as retry_exc:
-                    raise AITimeoutError() from retry_exc
-                except (APIConnectionError, APIStatusError, GroqError) as retry_exc:
-                    raise AIProviderError() from retry_exc
-                except (
-                    AIBudgetExceededError,
-                    AITimeoutError,
-                    AIAuthenticationError,
-                    AIRateLimitError,
-                    AIProviderError,
-                ):
-                    raise
-                except Exception as retry_exc:
-                    raise AIProviderError(
-                        "An unexpected error occurred while communicating with the AI service during rate-limit retry."
-                    ) from retry_exc
+                except RateLimitError as exc:
+                    category = classify_rate_limit(exc)
+                    retry_after_seconds = extract_retry_after_seconds(exc)
+                    retry_after = extract_retry_after(exc)
+                    code = provider_error_code(exc)
+                    logger.warning(
+                        "AI provider rate limit response in summarization",
+                        extra={
+                            "provider_status": 429,
+                            "provider_code": code if code in {"rate_limit_exceeded", "rate_limit_reached", "insufficient_quota", "quota_exceeded", "billing_hard_limit_reached", "billing_not_active"} else "other",
+                            "retryable": category == "temporary",
+                        },
+                    )
+                    if category == "quota":
+                        self.coordinator.other_outcome()
+                        raise AIQuotaExceededError() from exc
+                    if category != "temporary":
+                        self.coordinator.other_outcome()
+                        raise AIRateLimitError(retry_after=retry_after) from exc
 
-            raise AIRateLimitError(retry_after=retry_after) from exc
-        except APITimeoutError as exc:
-            raise AITimeoutError() from exc
-        except (APIConnectionError, APIStatusError, GroqError) as exc:
-            raise AIProviderError() from exc
-        except (
-            AIAuthenticationError,
-            AIRateLimitError,
-            AITimeoutError,
-            AIProviderError,
-            AIBudgetExceededError,
-        ):
+                    if rate_retries >= self.settings.AI_PROVIDER_RATE_LIMIT_MAX_RETRIES:
+                        self.coordinator.rate_limited()
+                        raise AIRateLimitError(retry_after=retry_after) from exc
+
+                    delay = retry_after_seconds
+                    if delay is None:
+                        delay = self.coordinator.backoff(
+                            rate_retries,
+                            initial=self.settings.AI_PROVIDER_BACKOFF_INITIAL_SECONDS,
+                            maximum=self.settings.AI_PROVIDER_BACKOFF_MAX_SECONDS,
+                            multiplier=self.settings.AI_PROVIDER_BACKOFF_MULTIPLIER,
+                        )
+                    logger.warning(
+                        "Retrying temporary AI provider rate limit in summarization",
+                        extra={"retry_attempt": rate_retries + 1, "retry_delay_seconds": delay, "provider_status": 429},
+                    )
+                    if not self.coordinator.wait_for_retry(delay, budget):
+                        self.coordinator.rate_limited()
+                        raise AIRateLimitError(retry_after=retry_after) from exc
+                    rate_retries += 1
+                    continue
+                except AuthenticationError as exc:
+                    self.coordinator.other_outcome()
+                    logger.error("AI provider authentication failed", extra={"provider_status": 401})
+                    raise AIAuthenticationError() from exc
+                except APITimeoutError as exc:
+                    if transient_retries < self.settings.AI_PROVIDER_TRANSIENT_MAX_RETRIES:
+                        delay = self.coordinator.backoff(
+                            transient_retries,
+                            initial=self.settings.AI_PROVIDER_TRANSIENT_BACKOFF_INITIAL_SECONDS,
+                            maximum=self.settings.AI_PROVIDER_TRANSIENT_BACKOFF_MAX_SECONDS,
+                            multiplier=self.settings.AI_PROVIDER_BACKOFF_MULTIPLIER,
+                        )
+                        logger.warning(
+                            "Retrying AI provider timeout in summarization",
+                            extra={"retry_attempt": transient_retries + 1, "retry_delay_seconds": delay},
+                        )
+                        if self.coordinator.wait_for_retry(delay, budget):
+                            transient_retries += 1
+                            continue
+                    self.coordinator.other_outcome()
+                    raise AITimeoutError() from exc
+                except APIConnectionError as exc:
+                    if transient_retries < self.settings.AI_PROVIDER_TRANSIENT_MAX_RETRIES:
+                        delay = self.coordinator.backoff(
+                            transient_retries,
+                            initial=self.settings.AI_PROVIDER_TRANSIENT_BACKOFF_INITIAL_SECONDS,
+                            maximum=self.settings.AI_PROVIDER_TRANSIENT_BACKOFF_MAX_SECONDS,
+                            multiplier=self.settings.AI_PROVIDER_BACKOFF_MULTIPLIER,
+                        )
+                        logger.warning(
+                            "Retrying AI provider connection failure in summarization",
+                            extra={"retry_attempt": transient_retries + 1, "retry_delay_seconds": delay},
+                        )
+                        if self.coordinator.wait_for_retry(delay, budget):
+                            transient_retries += 1
+                            continue
+                    self.coordinator.other_outcome()
+                    raise AIProviderError() from exc
+                except APIStatusError as exc:
+                    status_code = getattr(exc, "status_code", None)
+                    logger.error(
+                        "AI provider returned an HTTP error in summarization",
+                        extra={"provider_status": status_code, "provider_error_type": type(exc).__name__},
+                    )
+                    if status_code is not None and (status_code == 408 or status_code >= 500):
+                        if transient_retries < self.settings.AI_PROVIDER_TRANSIENT_MAX_RETRIES:
+                            delay = self.coordinator.backoff(
+                                transient_retries,
+                                initial=self.settings.AI_PROVIDER_TRANSIENT_BACKOFF_INITIAL_SECONDS,
+                                maximum=self.settings.AI_PROVIDER_TRANSIENT_BACKOFF_MAX_SECONDS,
+                                multiplier=self.settings.AI_PROVIDER_BACKOFF_MULTIPLIER,
+                            )
+                            logger.warning(
+                                "Retrying transient AI provider status in summarization",
+                                extra={"retry_attempt": transient_retries + 1, "retry_delay_seconds": delay, "provider_status": status_code},
+                            )
+                            if self.coordinator.wait_for_retry(delay, budget):
+                                transient_retries += 1
+                                continue
+                    self.coordinator.other_outcome()
+                    raise AIProviderError() from exc
+                except GroqError as exc:
+                    self.coordinator.other_outcome()
+                    logger.error("AI provider request failed in summarization", extra={"provider_error_type": type(exc).__name__})
+                    raise AIProviderError() from exc
+                except (AIBudgetExceededError, AITimeoutError, AICircuitOpenError):
+                    self.coordinator.other_outcome()
+                    raise
+                except Exception as exc:
+                    self.coordinator.other_outcome()
+                    logger.error("Unexpected AI provider failure in summarization", extra={"provider_error_type": type(exc).__name__})
+                    raise AIProviderError(
+                        "An unexpected error occurred while communicating with the AI service during summarization."
+                    ) from exc
+        except (AIBudgetExceededError, AITimeoutError, AICircuitOpenError):
+            self.coordinator.other_outcome()
             raise
-        except Exception as exc:
-            raise AIProviderError(
-                "An unexpected error occurred while communicating with the AI service during summarization."
-            ) from exc
 
     def _summarize_single_chunk(
         self,
@@ -440,7 +532,7 @@ class SummarizationService:
         for attempt in range(max_retries + 1):
             if budget is not None:
                 budget.check_deadline()
-            raw_response = self._call_groq(messages, max_tokens=1000, budget=budget)
+            raw_response = self._call_groq(messages, max_tokens=600, budget=budget)
 
             try:
                 data = clean_and_parse_summary_json(raw_response)
@@ -490,7 +582,7 @@ class SummarizationService:
         for attempt in range(max_retries + 1):
             if budget is not None:
                 budget.check_deadline()
-            raw_response = self._call_groq(messages, max_tokens=1500, budget=budget)
+            raw_response = self._call_groq(messages, max_tokens=1000, budget=budget)
 
             try:
                 data = clean_and_parse_summary_json(raw_response)
@@ -538,82 +630,112 @@ class SummarizationService:
 
         budget.check_deadline()
 
-        if target_bytes is None:
-            # Default target budget: comfortably within MAX_GENERATION_INPUT_BYTES
-            target_bytes = min(self.settings.MAX_GENERATION_INPUT_BYTES, 60 * 1024)
-
-        # 1. Semantic Chunking (Level 1)
-        chunks = chunk_text(text, max_chunk_size=max_chunk_size, chunk_overlap=chunk_overlap)
-        if not chunks:
-            return text
-
-        if len(chunks) == 1:
-            budget.consume_operation()
-            summary = self._summarize_single_chunk(
-                chunks[0], chunk_idx=1, total_chunks=1, budget=budget
+        def _do_hierarchical_summarization() -> str:
+            resolved_target_bytes = (
+                target_bytes
+                if target_bytes is not None
+                else min(self.settings.MAX_GENERATION_INPUT_BYTES, 60 * 1024)
             )
-            return self._enforce_summary_size_limit(summary)
 
-        # 2. Map Phase: Summarize each chunk independently
-        leaf_summaries: list[str] = []
-        total_chunks = len(chunks)
-        for idx, chunk in enumerate(chunks, start=1):
-            budget.consume_operation()
-            summary = self._summarize_single_chunk(
-                chunk, chunk_idx=idx, total_chunks=total_chunks, budget=budget
-            )
-            leaf_summaries.append(summary)
+            # 1. Semantic Chunking (Level 1)
+            chunks = chunk_text(text, max_chunk_size=max_chunk_size, chunk_overlap=chunk_overlap)
+            if not chunks:
+                return text
 
-        # 3. Check combined size of Level 1 summaries
-        combined_level_1 = "\n\n".join(leaf_summaries)
-        combined_bytes = len(combined_level_1.encode("utf-8"))
-
-        if combined_bytes <= target_bytes:
-            final_summary = combined_level_1
-        else:
-            # 4. Reduce Phase: Hierarchical Consolidation across multiple levels if needed
-            current_summaries = leaf_summaries
-            current_depth = 1
-
-            while current_depth < self.MAX_HIERARCHICAL_DEPTH:
-                current_depth += 1
-
-                # Group summaries into bundles that fit into consolidation context (~8 KB per bundle)
-                bundle_size = 4
-                bundles: list[list[str]] = [
-                    current_summaries[i : i + bundle_size]
-                    for i in range(0, len(current_summaries), bundle_size)
-                ]
-
-                consolidated_bundles: list[str] = []
-                for bundle in bundles:
-                    if len(bundle) == 1:
-                        consolidated_bundles.append(bundle[0])
+            # Early feasibility estimation check
+            total_chunks = len(chunks)
+            bundle_size = 6
+            est_operations = total_chunks
+            if total_chunks > 1:
+                cur = total_chunks
+                while cur > 1:
+                    bundles = (cur + bundle_size - 1) // bundle_size
+                    if bundles > 1:
+                        est_operations += bundles
+                        cur = bundles
                     else:
-                        budget.consume_operation()
-                        bundle_summary = self._consolidate_summaries(
-                            bundle, level=current_depth, budget=budget
-                        )
-                        consolidated_bundles.append(bundle_summary)
+                        est_operations += 1
+                        break
 
-                merged_text = "\n\n".join(consolidated_bundles)
-                merged_bytes = len(merged_text.encode("utf-8"))
-
-                if merged_bytes <= target_bytes or len(consolidated_bundles) <= 1:
-                    final_summary = merged_text
-                    break
-
-                current_summaries = consolidated_bundles
-            else:
-                if len(current_summaries) > 1:
-                    budget.consume_operation()
-                    final_summary = self._consolidate_summaries(
-                        current_summaries, level=self.MAX_HIERARCHICAL_DEPTH + 1, budget=budget
+            if budget is not None:
+                min_seconds_per_op = max(self.settings.AI_PROVIDER_MIN_REQUEST_INTERVAL_SECONDS + 0.25, 0.5)
+                min_est_duration = est_operations * min_seconds_per_op
+                if min_est_duration > budget.remaining_seconds():
+                    raise AIBudgetExceededError(
+                        f"Estimated processing duration ({min_est_duration:.1f}s) exceeds remaining request "
+                        f"time allowance ({budget.remaining_seconds():.1f}s). Please submit a smaller section."
                     )
-                else:
-                    final_summary = "\n\n".join(current_summaries)
 
-        return self._enforce_summary_size_limit(final_summary)
+            if total_chunks == 1:
+                budget.consume_operation()
+                summary = self._summarize_single_chunk(
+                    chunks[0], chunk_idx=1, total_chunks=1, budget=budget
+                )
+                return self._enforce_summary_size_limit(summary)
+
+            # 2. Map Phase: Summarize each chunk independently
+            leaf_summaries: list[str] = []
+            for idx, chunk in enumerate(chunks, start=1):
+                budget.consume_operation()
+                summary = self._summarize_single_chunk(
+                    chunk, chunk_idx=idx, total_chunks=total_chunks, budget=budget
+                )
+                leaf_summaries.append(summary)
+
+            # 3. Check combined size of Level 1 summaries
+            combined_level_1 = "\n\n".join(leaf_summaries)
+            combined_bytes = len(combined_level_1.encode("utf-8"))
+
+            if combined_bytes <= resolved_target_bytes:
+                final_summary = combined_level_1
+            else:
+                # 4. Reduce Phase: Hierarchical Consolidation across multiple levels if needed
+                current_summaries = leaf_summaries
+                current_depth = 1
+
+                while current_depth < self.MAX_HIERARCHICAL_DEPTH:
+                    current_depth += 1
+
+                    bundles = [
+                        current_summaries[i : i + bundle_size]
+                        for i in range(0, len(current_summaries), bundle_size)
+                    ]
+
+                    consolidated_bundles: list[str] = []
+                    for bundle in bundles:
+                        if len(bundle) == 1:
+                            consolidated_bundles.append(bundle[0])
+                        else:
+                            budget.consume_operation()
+                            bundle_summary = self._consolidate_summaries(
+                                bundle, level=current_depth, budget=budget
+                            )
+                            consolidated_bundles.append(bundle_summary)
+
+                    merged_text = "\n\n".join(consolidated_bundles)
+                    merged_bytes = len(merged_text.encode("utf-8"))
+
+                    if merged_bytes <= resolved_target_bytes or len(consolidated_bundles) <= 1:
+                        final_summary = merged_text
+                        break
+
+                    current_summaries = consolidated_bundles
+                else:
+                    if len(current_summaries) > 1:
+                        budget.consume_operation()
+                        final_summary = self._consolidate_summaries(
+                            current_summaries, level=self.MAX_HIERARCHICAL_DEPTH + 1, budget=budget
+                        )
+                    else:
+                        final_summary = "\n\n".join(current_summaries)
+
+            return self._enforce_summary_size_limit(final_summary)
+
+        if self.summary_cache is not None:
+            return self.summary_cache.get_or_compute(
+                text, _do_hierarchical_summarization, budget=budget
+            )
+        return _do_hierarchical_summarization()
 
     def _enforce_summary_size_limit(self, summary: str) -> str:
         """Ensure that summary strictly satisfies MAX_GENERATION_INPUT_BYTES."""
